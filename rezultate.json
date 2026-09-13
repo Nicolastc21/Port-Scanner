@@ -1,0 +1,20 @@
+{
+    "scan_metadata": {
+        "target": "192.168.1.1",
+        "ip": "192.168.1.1",
+        "timestamp": "2026-09-13T19:53:13.579010",
+        "ports_scanned": 45
+    },
+    "open_ports": [
+        {
+            "port": 80,
+            "service": "HTTP",
+            "banner_or_title": "HTTP/1.1 200 OK | Title: "
+        },
+        {
+            "port": 443,
+            "service": "HTTPS",
+            "banner_or_title": "HTTP/1.1 400 Bad Request | Title: "
+        }
+    ]
+}
