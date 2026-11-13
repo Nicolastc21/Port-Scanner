@@ -7,9 +7,12 @@ import ssl
 import json
 import csv
 import ipaddress
-from datetime import datetime
+from datetime import datetime, timezone
 from queue import Queue, Empty
 from typing import Optional, Tuple, List
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from html.parser import HTMLParser
+from threading import Lock
 
 COMMON_SERVICES = {
     21: "FTP", 22: "SSH", 23: "Telnet", 25: "SMTP", 53: "DNS",
@@ -45,11 +48,13 @@ PROBES = {
 HTTP_PORTS = {80, 8000, 8080, 8888, 3000, 5000, 7001}
 HTTPS_PORTS = {443, 8443}
 
-print_lock = threading.Lock()
-counter_lock = threading.Lock()
-results = []
-scanned = 0
-total_ports = 0
+class ScanState:
+    def __init__(self, total):
+        self.lock = Lock()
+        self.print_lock = Lock()
+        self.results = []
+        self.scanned = 0
+        self.total = total
 
 
 def get_service(port: int) -> str:
@@ -63,7 +68,7 @@ def get_service(port: int) -> str:
 
 def grab_banner(sock: socket.socket, port: int) -> Optional[str]:
     try:
-        probe = PROBES.get(port, b"HEAD / HTTP/1.0\r\n\r\n")
+        probe = PROBES.get(port, b"")
         if probe:
             sock.send(probe)
         raw = sock.recv(1024).decode("utf-8", errors="ignore").strip()
@@ -73,64 +78,81 @@ def grab_banner(sock: socket.socket, port: int) -> Optional[str]:
         return None
 
 
+class TitleParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.in_title = False
+        self.parts = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag.lower() == "title":
+            self.in_title = True
+
+    def handle_endtag(self, tag):
+        if tag.lower() == "title":
+            self.in_title = False
+
+    def handle_data(self, data):
+        if self.in_title:
+            self.parts.append(data)
+
+
 def get_web_title(host: str, port: int, timeout: float) -> Optional[str]:
     try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(timeout)
-
-        if port in HTTPS_PORTS:
-            context = ssl.create_default_context()
-            context.check_hostname = False
-            context.verify_mode = ssl.CERT_NONE
-            sock = context.wrap_socket(sock, server_hostname=host)
-
-        sock.connect((host, port))
-        request = f"GET / HTTP/1.1\r\nHost: {host}\r\nUser-Agent: PortScanner/3.0\r\nConnection: close\r\n\r\n"
-        sock.sendall(request.encode())
-
-        response = b""
-        while True:
-            data = sock.recv(2048)
-            if not data:
-                break
-            response += data
-            if b"</title>" in response.lower() or len(response) > 50000:
-                break
-        sock.close()
-
-        html = response.decode('utf-8', errors='ignore')
-        match = re.search(r'<title[^>]*>(.*?)</title>', html, re.IGNORECASE | re.DOTALL)
-        if match:
-            title = match.group(1).strip()
-            title = re.sub(r'\s+', ' ', title)
-            return f"Title: {title[:50]}"
-    except Exception:
+        addresses = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        family, socktype, proto, _, address = addresses[0]
+        with socket.socket(family, socktype, proto) as raw:
+            raw.settimeout(timeout)
+            if port in HTTPS_PORTS:
+                # Keep certificate verification enabled; title extraction is optional.
+                with ssl.create_default_context().wrap_socket(raw, server_hostname=host) as sock:
+                    sock.connect(address)
+                    return _read_web_title(sock, host, timeout)
+            raw.connect(address)
+            return _read_web_title(raw, host, timeout)
+    except (OSError, ssl.SSLError, ValueError):
         return None
-    return None
+
+
+def _read_web_title(sock, host, timeout):
+    sock.sendall((f"GET / HTTP/1.0\r\nHost: {host}\r\nUser-Agent: PortScanner/3.0\r\nConnection: close\r\n\r\n").encode("utf-8"))
+    response = bytearray()
+    while len(response) < 50000:
+        try:
+            chunk = sock.recv(min(4096, 50000 - len(response)))
+        except socket.timeout:
+            break
+        if not chunk:
+            break
+        response.extend(chunk)
+    body = bytes(response).split(b"\r\n\r\n", 1)[-1].decode("utf-8", errors="replace")
+    parser = TitleParser()
+    parser.feed(body)
+    title = re.sub(r"\s+", " ", " ".join(parser.parts)).strip()
+    return f"Title: {title[:50]}" if title else None
 
 
 def scan_port(host: str, port: int, timeout: float) -> Tuple[int, bool, Optional[str], Optional[str]]:
     try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(timeout)
-        if sock.connect_ex((host, port)) == 0:
-            service = get_service(port)
-            banner = grab_banner(sock, port)
-            sock.close()
-
-            if port in HTTP_PORTS or port in HTTPS_PORTS:
-                title = get_web_title(host, port, timeout)
-                if title:
-                    banner = f"{banner} | {title}" if banner else title
-
-            return (port, True, service, banner)
-        sock.close()
-    except socket.error:
+        family = socket.AF_INET6 if ":" in host else socket.AF_INET
+        with socket.socket(family, socket.SOCK_STREAM) as sock:
+            sock.settimeout(timeout)
+            if sock.connect_ex((host, port)) == 0:
+                service = get_service(port)
+                banner = grab_banner(sock, port)
+                if port in HTTP_PORTS or port in HTTPS_PORTS:
+                    title = get_web_title(host, port, timeout)
+                    if title:
+                        banner = f"{banner} | {title}" if banner else title
+                return (port, True, service, banner)
+    except OSError:
         pass
     return (port, False, None, None)
 
 
 def show_progress(current: int, total: int, open_count: int):
+    if total <= 0:
+        return
     pct = current / total
     bar = int(pct * 30)
     line = (f"\r  [{'█' * bar}{'░' * (30 - bar)}] "
@@ -139,8 +161,7 @@ def show_progress(current: int, total: int, open_count: int):
     sys.stdout.flush()
 
 
-def worker(host: str, queue: Queue, timeout: float):
-    global scanned
+def worker(host: str, queue: Queue, timeout: float, state: ScanState):
     while True:
         try:
             port = queue.get_nowait()
@@ -149,21 +170,21 @@ def worker(host: str, queue: Queue, timeout: float):
 
         port_num, is_open, service, banner = scan_port(host, port, timeout)
 
-        with counter_lock:
-            scanned += 1
-            current = scanned
-            open_count = len(results)
-
+        with state.lock:
+            state.scanned += 1
+            current = state.scanned
         if is_open:
-            with print_lock:
+            with state.lock:
+                state.results.append((port_num, service, banner))
+                open_count = len(state.results)
+            with state.print_lock:
                 sys.stdout.write("\r" + " " * 75 + "\r")
                 banner_str = f"  [{banner}]" if banner else ""
                 print(f"  [+] {port_num:<6} {service:<12}{banner_str}")
-                results.append((port_num, service, banner))
-                show_progress(current, total_ports, len(results))
+                show_progress(current, state.total, open_count)
         else:
-            with print_lock:
-                show_progress(current, total_ports, open_count)
+            with state.print_lock:
+                show_progress(current, state.total, len(state.results))
 
         queue.task_done()
 
@@ -176,44 +197,46 @@ def resolve_host(host: str) -> str:
         sys.exit(1)
 
 
-def save_txt(filepath: str, host: str, ip: str, args):
-    with open(filepath, "w") as f:
+def save_txt(filepath: str, host: str, ip: str, args, scan_results):
+    with open(filepath, "w", encoding="utf-8") as f:
         f.write("=" * 60 + "\n")
         f.write("  Port Scanner — Nicolas-Costin Tanasache\n")
         f.write("=" * 60 + "\n")
         f.write(f"  Target  : {host} ({ip})\n")
         f.write(f"  Date    : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write("=" * 60 + "\n\n")
-        if results:
+        if scan_results:
             f.write(f"  {'PORT':<8} {'SERVICE':<12} BANNER / TITLE\n")
             f.write(f"  {'-' * 60}\n")
-            for port, service, banner in sorted(results):
+            for port, service, banner in sorted(scan_results):
                 b = banner if banner else "-"
                 f.write(f"  {port:<8} {service:<12} {b}\n")
 
 
-def save_json(filepath: str, host: str, ip: str, args):
+def save_json(filepath: str, host: str, ip: str, args, scan_results, scanned_count):
     data = {
         "scan_metadata": {
             "target": host,
             "ip": ip,
-            "timestamp": datetime.now().isoformat(),
-            "ports_scanned": total_ports
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "ports_scanned": scanned_count,
+            "timeout_seconds": args.timeout,
+            "threads": args.threads
         },
         "open_ports": [
             {"port": p, "service": s, "banner_or_title": b}
-            for p, s, b in sorted(results)
+            for p, s, b in sorted(scan_results)
         ]
     }
-    with open(filepath, "w") as f:
+    with open(filepath, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=4)
 
 
-def save_csv(filepath: str):
+def save_csv(filepath: str, scan_results):
     with open(filepath, "w", newline="", encoding='utf-8') as f:
         writer = csv.writer(f)
         writer.writerow(["Port", "Service", "Banner_Title"])
-        for p, s, b in sorted(results):
+        for p, s, b in sorted(scan_results):
             writer.writerow([p, s, b or ""])
 
 
@@ -246,29 +269,16 @@ def scan_network(network: str, ports: List[int], args) -> None:
 
     print(f"\n  [*] Network scan: {network}")
     print(f"  [*] Total hosts : {total_hosts}")
-    print(f"  [*] Discovering live hosts (timeout: {args.timeout}s)...\n")
+    print(f"  [*] Discovering live hosts (TCP heuristic, timeout: {args.timeout}s)...\n")
 
     live_hosts = []
-    disc_lock = threading.Lock()
-
-    def discover(ip):
-        if ping_host(ip, args.timeout):
-            with disc_lock:
+    with ThreadPoolExecutor(max_workers=args.threads) as pool:
+        futures = {pool.submit(ping_host, ip, args.timeout): ip for ip in hosts}
+        for future in as_completed(futures):
+            ip = futures[future]
+            if future.result():
                 live_hosts.append(ip)
                 print(f"  [+] Host UP: {ip}")
-
-    disc_threads = []
-    for ip in hosts:
-        t = threading.Thread(target=discover, args=(ip,))
-        t.daemon = True
-        t.start()
-        disc_threads.append(t)
-        if len(disc_threads) >= args.threads:
-            for dt in disc_threads:
-                dt.join()
-            disc_threads = []
-    for dt in disc_threads:
-        dt.join()
 
     if not live_hosts:
         print("\n  [!] No live hosts found.")
@@ -280,10 +290,7 @@ def scan_network(network: str, ports: List[int], args) -> None:
     all_results = {}
 
     for ip in live_hosts:
-        global results, scanned, total_ports
-        results = []
-        scanned = 0
-        total_ports = len(ports)
+        state = ScanState(len(ports))
 
         print("=" * 60)
         print(f"  Scanning {ip}")
@@ -294,30 +301,33 @@ def scan_network(network: str, ports: List[int], args) -> None:
             queue.put(p)
 
         threads_list = []
-        for _ in range(min(args.threads, total_ports)):
-            t = threading.Thread(target=worker, args=(ip, queue, args.timeout))
+        for _ in range(min(args.threads, len(ports))):
+            t = threading.Thread(target=worker, args=(ip, queue, args.timeout, state))
             t.daemon = True
             t.start()
             threads_list.append(t)
         for t in threads_list:
             t.join()
 
-        print(f"\n\n  Open ports: {len(results)}")
-        if results:
+        print(f"\n\n  Open ports: {len(state.results)}")
+        if state.results:
             print(f"  {'PORT':<8} {'SERVICE':<12} BANNER / TITLE")
             print(f"  {'-' * 50}")
-            for port, service, banner in sorted(results):
+            for port, service, banner in sorted(state.results):
                 b = banner if banner else "-"
                 print(f"  {port:<8} {service:<12} {b[:45]}")
         print()
 
-        all_results[ip] = list(results)
+        all_results[ip] = list(state.results)
 
     if args.json:
         data = {
             "scan_type": "network",
             "network": network,
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "ports_scanned_per_host": len(ports),
+            "timeout_seconds": args.timeout,
+            "threads": args.threads,
             "live_hosts": len(live_hosts),
             "results": {
                 ip: [{"port": p, "service": s, "banner": b}
@@ -325,13 +335,26 @@ def scan_network(network: str, ports: List[int], args) -> None:
                 for ip in all_results
             }
         }
-        with open(args.json, "w") as f:
+        with open(args.json, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=4)
         print(f"  [+] Network report saved: {args.json}")
+    if args.output:
+        with open(args.output, "w", encoding="utf-8") as out:
+            out.write(f"Network scan: {network}\nUTC timestamp: {datetime.now(timezone.utc).isoformat()}\n")
+            for ip, entries in all_results.items():
+                out.write(f"\n{ip}\n" + "-" * 50 + "\n")
+                for p, service, banner in sorted(entries):
+                    out.write(f"{p:<8} {service:<12} {banner or '-'}\n")
+    if args.csv:
+        with open(args.csv, "w", newline="", encoding="utf-8") as out:
+            writer = csv.writer(out)
+            writer.writerow(["Host", "Port", "Service", "Banner_Title"])
+            for ip, entries in all_results.items():
+                for p, service, banner in sorted(entries):
+                    writer.writerow([ip, p, service, banner or ""])
 
 
 def main():
-    global total_ports
 
     parser = argparse.ArgumentParser(
         description="Multithreaded TCP Port Scanner with Network Discovery",
@@ -358,8 +381,19 @@ def main():
     parser.add_argument("--top", action="store_true", help="Scan only the top common ports")
     args = parser.parse_args()
 
+    if args.threads < 1 or args.threads > 1000:
+        parser.error("--threads must be between 1 and 1000")
+    if not 0.05 <= args.timeout <= 300:
+        parser.error("--timeout must be between 0.05 and 300 seconds")
+    if args.network and args.host:
+        parser.error("--network cannot be combined with a host")
+    if args.host and (args.start_port != 1 or args.end_port != 1024) and (args.ports or args.top):
+        parser.error("positional port range cannot be combined with --ports or --top")
+
     if args.ports:
         try:
+            if not args.ports.strip():
+                raise ValueError
             port_list = sorted(set(int(p.strip()) for p in args.ports.split(",")))
             if any(p < 1 or p > 65535 for p in port_list):
                 raise ValueError
@@ -378,6 +412,12 @@ def main():
         label = f"{args.start_port} - {args.end_port}"
 
     if args.network:
+        try:
+            net = ipaddress.IPv4Network(args.network, strict=False)
+            if net.num_addresses > 4096:
+                parser.error("network scans are limited to 4096 addresses")
+        except ValueError as exc:
+            parser.error(f"invalid network: {exc}")
         print("=" * 60)
         print("  Port Scanner — Nicolas-Costin Tanasache")
         print("=" * 60)
@@ -396,6 +436,7 @@ def main():
 
     ip = resolve_host(args.host)
     total_ports = len(port_list)
+    state = ScanState(total_ports)
 
     print("=" * 60)
     print("  Port Scanner — Nicolas-Costin Tanasache")
@@ -421,7 +462,7 @@ def main():
 
     threads = []
     for _ in range(min(args.threads, total_ports)):
-        t = threading.Thread(target=worker, args=(ip, queue, args.timeout))
+        t = threading.Thread(target=worker, args=(ip, queue, args.timeout, state))
         t.daemon = True
         t.start()
         threads.append(t)
@@ -433,25 +474,26 @@ def main():
 
     print("\n\n" + "=" * 60)
     print(f"  Scan complete in {duration:.2f}s")
-    print(f"  Open ports found: {len(results)}")
+    print(f"  Open ports found: {len(state.results)}")
 
-    if results:
+    if state.results:
         print(f"\n  {'PORT':<8} {'SERVICE':<12} BANNER / TITLE")
         print(f"  {'-' * 60}")
-        for port, service, banner in sorted(results):
+        for port, service, banner in sorted(state.results):
             b = banner if banner else "-"
             print(f"  {port:<8} {service:<12} {b[:55]}")
     print("=" * 60)
 
     if args.output:
-        save_txt(args.output, args.host, ip, args)
+        save_txt(args.output, args.host, ip, args, state.results)
         print(f"  [+] Saved TXT  : {args.output}")
     if args.json:
-        save_json(args.json, args.host, ip, args)
+        save_json(args.json, args.host, ip, args, state.results, state.scanned)
         print(f"  [+] Saved JSON : {args.json}")
     if args.csv:
-        save_csv(args.csv)
+        save_csv(args.csv, state.results)
         print(f"  [+] Saved CSV  : {args.csv}")
 
 if __name__ == "__main__":
     main()
+
