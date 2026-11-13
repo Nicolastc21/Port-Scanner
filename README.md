@@ -5,21 +5,31 @@ A fast, multithreaded TCP port scanner with network discovery, service detection
 ## Features
 
 - **Network scan** — discover live hosts and scan an entire CIDR range (e.g. `192.168.1.0/24`)
-- **Host discovery** — checks if a host is alive before scanning
+- **Host discovery** — optional TCP-based heuristic; firewalls can hide live hosts
 - **Multithreaded scanning** — configurable thread count for fast results
 - **Service detection** — identifies 40+ common services (SSH, HTTP, FTP, MySQL, RDP, etc.)
-- **Banner grabbing** — sends protocol-specific probes to retrieve service banners
+- **Banner grabbing** — reads unsolicited banners and uses limited probes for selected protocols
 - **HTML title extraction** — fetches the `<title>` tag from HTTP/HTTPS ports
-- **SSL/HTTPS support** — connects correctly on ports 443/8443
+- **SSL/HTTPS support** — verifies certificates before fetching page titles on ports 443/8443
 - **Live progress bar** — real-time visual feedback during scanning
 - **Custom port list** — scan specific ports with `--ports 22,80,443,3306`
 - **Top ports mode** — quickly scan the 46 most common ports with `--top`
 - **Multi-format export** — save results as TXT, JSON, or CSV
 - **No external dependencies** — pure Python standard library only
+- **Bounded concurrency** — threads are limited to 1–1000; network scans are capped at 4096 addresses
 
 ## Requirements
 
 - Python 3.6+
+
+## Scan behavior and limitations
+
+- This is a TCP connect scanner. A successful connection means a TCP port accepted a connection; service labels are port-based guesses.
+- Host discovery checks a small set of TCP ports. A live host that blocks those ports can be missed. Use a single-host scan to scan even when discovery reports the target as down.
+- Only IPv4 CIDR networks are supported. Single-host scans accept IPv4 addresses and hostnames.
+- HTTPS title extraction uses normal certificate verification. If a certificate is invalid or issued for a different name, the port can still be reported open, but its title may be unavailable.
+- `--output`, `--json`, and `--csv` work in both single-host and network modes.
+- Scanning systems requires authorization. Limit concurrency and scan scope to what your network and permission allow.
 
 ## Installation
 
@@ -165,3 +175,4 @@ Unauthorized port scanning may be illegal in your jurisdiction.
 
 **Nicolas-Costin Tanasache**  
 [LinkedIn](https://linkedin.com/in/nicolas-costin-tanasache-954348362) • [TryHackMe](https://tryhackme.com/p/nicolas.tanasache) • [GitHub](https://github.com/Nicolastc21)
+
